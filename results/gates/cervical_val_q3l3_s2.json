@@ -1,0 +1,30 @@
+{
+ "checkpoint": "/scratch90/chris_/quantum/qvr_cervix/results_final_circuit_fixed/q3_l3_fixed_ne10_s2_norm_per_timepoint_sl1.00e-2/training/trained_model.pt",
+ "split": "val",
+ "cfg": {
+  "n_qubits": 3,
+  "n_layers": 3,
+  "k": 3,
+  "N_E": 10,
+  "tau": 1.0,
+  "sigma_lambda": 0.01
+ },
+ "n": 735668,
+ "n_pos": 22903,
+ "n_units": 39,
+ "out_of_range": {
+  "0": 2.063216116523844e-06,
+  "1": 0.00011300857067273488
+ },
+ "seed": 0,
+ "reference": null,
+ "git": {
+  "commit": null,
+  "dirty": null
+ },
+ "auc": {
+  "averaged": 0.7420632469504478,
+  "mean": 0.8217181597802746,
+  "mc": 0.7640833724905577
+ }
+}
