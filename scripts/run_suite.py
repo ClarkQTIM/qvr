@@ -227,13 +227,23 @@ def e4_probe(F_fit, y_fit, u_fit, F_eval, y_eval, classes, n_perm=0, seed=0):
     return out
 
 
-def e5_hamiltonian(params, cfg):
-    lam = C.eigenvalues(params['mu'], cfg).numpy()
-    gaps = np.diff(np.sort(lam))
-    mu = params['mu'].abs().numpy()
+def _S_r(mu, cfg):
+    mu = np.abs(np.asarray(mu))
     orders = [len(c) for c in cfg.terms]
-    S = {r: float(mu[[i for i, o in enumerate(orders) if o == r]].sum() / mu.sum()) for r in sorted(set(orders))}
-    return {'min_gap': float(gaps.min()), 'S_r': S, 'abs_sigma': params['sigma'].abs().tolist()}
+    return {r: float(mu[[i for i, o in enumerate(orders) if o == r]].sum() / mu.sum()) for r in sorted(set(orders))}
+
+
+def e5_hamiltonian(params, cfg, init=None):
+    """Eigenvalue gaps and interaction-order weights; compared with the initialization, because
+    S_r of a random init is already ≈ (terms of order r) / (all terms), e.g. 3/7, 3/7, 1/7."""
+    lam = C.eigenvalues(params['mu'], cfg).numpy()
+    out = {'min_gap': float(np.diff(np.sort(lam)).min()), 'S_r': _S_r(params['mu'].numpy(), cfg),
+           'abs_sigma': params['sigma'].abs().tolist()}
+    if init is not None:
+        out['S_r_init'] = _S_r(init['mu'].numpy(), cfg)
+        out['mean_abs_dmu'] = float((params['mu'] - init['mu']).abs().mean())
+        out['mean_abs_sigma_init'] = float(init['sigma'].abs().mean())
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +320,11 @@ def analyze(data_dir, out, channel, nes, seeds, n_boot, n_perm):
 
     # E5
     for ne in nes:
-        rep['E5'][str(ne)] = [e5_hamiltonian(load_run(Path(out) / 'models' / f'ne{ne}_s{s}')[0], fixed_cfg(ne)) for s in seeds]
+        rows = []
+        for s in seeds:
+            p, _, ck = load_run(Path(out) / 'models' / f'ne{ne}_s{s}')
+            rows.append(e5_hamiltonian(p, fixed_cfg(ne), ck.get('init_params')))
+        rep['E5'][str(ne)] = rows
 
     # score_audit hand-off (reference N_E, seed-rank-averaged mc scores)
     np.savez(Path(out) / 'scores' / 'ref_mc_scores.npz',
@@ -356,11 +370,18 @@ def _markdown(rep, groups, nes):
                          f"{m.get('null_p95', float('nan')):.3f} | {m.get('p_value', float('nan')):.3f} |")
     else:
         L.append('Not run (fewer than two eligible classes or no Xprobe).')
-    L += ['', '## E5 Hamiltonian (mean over seeds)', '', '| N_E | min gap | S_1 | S_2 | S_3 |', '| --- | --- | --- | --- | --- |']
+    L += ['', '## E5 Hamiltonian (mean over seeds; S_r at initialization in parentheses)', '',
+          '| N_E | min gap | S_1 | S_2 | S_3 | mean abs Δμ from init | mean abs σ (init → trained) |', '| --- | --- | --- | --- | --- | --- | --- |']
     for n in nes:
         rows = rep['E5'][str(n)]
-        L.append(f"| {n} | {np.mean([r['min_gap'] for r in rows]):.3f} | " +
-                 ' | '.join(f"{np.mean([r['S_r'][k] for r in rows]):.2f}" for k in (1, 2, 3)) + ' |')
+        has0 = all('S_r_init' in r for r in rows)
+        cell = lambda k: (f"{np.mean([r['S_r'][k] for r in rows]):.2f}" +  # noqa: E731
+                          (f" ({np.mean([r['S_r_init'][k] for r in rows]):.2f})" if has0 else ''))
+        dmu = f"{np.mean([r['mean_abs_dmu'] for r in rows]):.3f}" if has0 else '—'
+        sig = (f"{np.mean([r['mean_abs_sigma_init'] for r in rows]):.2f} → {np.mean([np.mean(r['abs_sigma']) for r in rows]):.2f}"
+               if has0 else f"{np.mean([np.mean(r['abs_sigma']) for r in rows]):.2f}")
+        L.append(f"| {n} | {np.mean([r['min_gap'] for r in rows]):.3f} | " + ' | '.join(cell(k) for k in (1, 2, 3))
+                 + f' | {dmu} | {sig} |')
     return '\n'.join(L) + '\n'
 
 
@@ -405,7 +426,8 @@ def _self_test():
             'E3 identity pooled AUC present': 'identity' in rep['E3']['pooled']['3'],
             'E4 ran with a permutation null': rep['E4'].get('moments') is not None
                                               and 'p_value' in rep['E4']['moments']['logreg'],
-            'E5 S_r sums to 1': all(abs(sum(r['S_r'].values()) - 1) < 1e-9 for r in rep['E5']['1']),
+            'E5 S_r sums to 1, init comparison present': all(abs(sum(r['S_r'].values()) - 1) < 1e-9 and 'S_r_init' in r
+                                                             for r in rep['E5']['1']),
             'summary.md + score_audit hand-off written': (Path(tmp) / 'out' / 'summary.md').exists()
                                                         and (Path(tmp) / 'out' / 'scores' / 'ref_mc_scores.npz').exists(),
             'resumable (second run skips)': 'exists' in _score_one((str(Path(tmp) / 'syn'), str(Path(tmp) / 'out'), 0, 1, 0)),
