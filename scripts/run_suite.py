@@ -327,8 +327,11 @@ def analyze(data_dir, out, channel, nes, seeds, n_boot, n_perm):
         rep['E5'][str(ne)] = rows
 
     # score_audit hand-off (reference N_E, seed-rank-averaged mc scores)
-    np.savez(Path(out) / 'scores' / 'ref_mc_scores.npz',
-             **{k: _rank_avg([S[(ref, s)][f'mc__{k}'] for s in seeds]) for k in ['Xte_norm'] + sets})
+    # ranks must be computed JOINTLY over all test sets (per-set ranks are uniform → AUC 0.5 by construction)
+    keys = ['Xte_norm'] + sets
+    joint = _rank_avg([np.concatenate([S[(ref, s)][f'mc__{k}'] for k in keys]) for s in seeds])
+    cuts = np.cumsum([len(S[(ref, seeds[0])][f'mc__{k}']) for k in keys])[:-1]
+    np.savez(Path(out) / 'scores' / 'ref_mc_scores.npz', **dict(zip(keys, np.split(joint, cuts))))
     (Path(out) / 'summary.json').write_text(json.dumps(rep, indent=1, default=float))
     md = _markdown(rep, groups, nes)
     (Path(out) / 'summary.md').write_text(md)
@@ -430,6 +433,9 @@ def _self_test():
                                                              for r in rep['E5']['1']),
             'summary.md + score_audit hand-off written': (Path(tmp) / 'out' / 'summary.md').exists()
                                                         and (Path(tmp) / 'out' / 'scores' / 'ref_mc_scores.npz').exists(),
+            'hand-off scores reproduce E1 pooled AUC': abs(roc_auc(*(lambda z: (np.r_[np.zeros(len(z['Xte_norm'])), np.ones(sum(len(z[k]) for k in z.files if k != 'Xte_norm'))],
+                                                                      np.r_[z['Xte_norm'], np.concatenate([z[k] for k in z.files if k != 'Xte_norm'])]))(
+                np.load(Path(tmp) / 'out' / 'scores' / 'ref_mc_scores.npz'))) - rep['E1']['pooled']['ref_seed_avg']['auc']) < 1e-9,
             'resumable (second run skips)': 'exists' in _score_one((str(Path(tmp) / 'syn'), str(Path(tmp) / 'out'), 0, 1, 0)),
         }
         for k, v in checks.items():
