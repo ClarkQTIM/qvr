@@ -294,6 +294,77 @@ def prepare_synthetic(out, seq_len=16, seed=1989, scale=PI / 1.5):
 
 
 # ---------------------------------------------------------------------------
+# Memory test (E6): identical per-timepoint marginals, different dependence
+# ---------------------------------------------------------------------------
+
+MEM_SPLITS = {'normal': {'Xtr': 2000, 'Xval_norm': 300, 'Xte_norm': 400},
+              'anomaly': {'Xval': 100, 'Xprobe': 200, 'Xte': 300}}
+
+
+def _ar1(n, T, phi, rng):
+    """Stationary AR(1) with unit marginal variance: every x_t ~ N(0, 1) exactly."""
+    x = np.empty((n, T))
+    x[:, 0] = rng.normal(size=n)
+    s = math.sqrt(1 - phi ** 2)
+    for t in range(1, T):
+        x[:, t] = phi * x[:, t - 1] + s * rng.normal(size=n)
+    return x
+
+
+def prepare_memory(out, seq_len=32, seed=2026, phi=0.95, scale=PI / 3):
+    """
+    Normal: AR(1), φ = 0.95 (smooth, strongly autocorrelated).
+    Anomalies, each with the SAME N(0, 1) marginal at every timepoint:
+      iid       independent N(0, 1) values (no memory)
+      anti      AR(1), φ = −0.95 (alternating)
+      shuffled  normal-process series with time randomly permuted
+    Per-timepoint marginal models (QVR's additive score, per-t histogram, per-t z²) and
+    order-invariant features are blind by construction (expected AUC ≈ 0.5); only models
+    with memory, or classical lag statistics, can detect the anomalies.
+    Fixed scaling x·π/3, clipped (|x| > 3: ≈ 0.3% of values).
+    """
+    rng = np.random.default_rng(seed)
+    sets = {}
+    Xn = _ar1(sum(MEM_SPLITS['normal'].values()), seq_len, phi, rng)
+    i = 0
+    for k, n in MEM_SPLITS['normal'].items():
+        sets[k], i = Xn[i:i + n], i + n
+        sets[f'{k}_subtype'] = np.array(['normal'] * n)
+    gens = {'iid': lambda n: rng.normal(size=(n, seq_len)),
+            'anti': lambda n: _ar1(n, seq_len, -phi, rng),
+            'shuffled': lambda n: np.take_along_axis(_ar1(n, seq_len, phi, rng),
+                                                     np.argsort(rng.random((n, seq_len)), 1), 1)}
+    parts = {'Xval': [], 'Xprobe': []}
+    for c, gen in gens.items():
+        a, b, n_te = MEM_SPLITS['anomaly']['Xval'], MEM_SPLITS['anomaly']['Xprobe'], MEM_SPLITS['anomaly']['Xte']
+        Xa = gen(a + b + n_te)
+        parts['Xval'].append((Xa[:a], c))
+        parts['Xprobe'].append((Xa[a:a + b], c))
+        sets[f'Xte_{c}'] = Xa[a + b:]
+        sets[f'Xte_{c}_subtype'] = np.array([c] * n_te)
+    for k, lst in parts.items():
+        sets[k] = np.concatenate([x for x, _ in lst])
+        sets[f'{k}_subtype'] = np.concatenate([[c] * len(x) for x, c in lst])
+    oor, counts = {}, {}
+    for k in list(sets):
+        if k.endswith('_subtype'):
+            continue
+        z = sets[k] * scale
+        oor[k] = float(np.mean(np.abs(z) > PI))
+        sets[k] = np.clip(z, -PI, PI)[:, None, :]
+        sets[f'{k}_units'] = np.arange(len(z)).astype(str)
+        counts[k] = len(z)
+    manifest = {'dataset': 'memory test (AR(1) normals; same-marginal anomalies)', 'seq_len': seq_len,
+                'seed': seed, 'phi': phi, 'normalization': f'fixed affine x·{scale:.6f} (π/3), clipped',
+                'classes': {'normal': f'AR(1) φ={phi}', 'iid': 'iid N(0,1)', 'anti': f'AR(1) φ={-phi}',
+                            'shuffled': 'normal series, time permuted'},
+                'fraction_clipped': oor, 'counts': counts,
+                'note': 'identical N(0,1) marginal at every timepoint for all classes'}
+    _write(out, sets, manifest)
+    return manifest
+
+
+# ---------------------------------------------------------------------------
 # Self-test
 # ---------------------------------------------------------------------------
 
@@ -354,6 +425,16 @@ def _self_test():
         check('figures written (both datasets)', all(Path(f).exists() for f in m['figures'] + s['figures']))
         check('E4 eligibility computed per subtype', set(m['e4_eligibility']) == {'fusion', 'supraventricular', 'ventricular'},
               str({c: v['eligible'] for c, v in m['e4_eligibility'].items()}))
+        mm = prepare_memory(Path(tmp) / 'mem')
+        dm = splitdir.load_all(Path(tmp) / 'mem')
+        sd = {k: float(dm[k][:, :, 0].std(0).mean()) for k in ('Xte_norm', 'Xte_iid', 'Xte_anti', 'Xte_shuffled')}
+        check('memory set: same per-timepoint spread in every class', max(sd.values()) - min(sd.values()) < 0.1,
+              ' '.join(f'{k[4:]} {v:.2f}' for k, v in sd.items()))
+        lag1 = {k: float(np.mean([np.corrcoef(x[:-1], x[1:])[0, 1] for x in dm[k][:200, :, 0].numpy()]))
+                for k in ('Xte_norm', 'Xte_iid', 'Xte_anti')}
+        check('memory set: dependence differs (lag-1 autocorrelation)',
+              lag1['Xte_norm'] > 0.7 and abs(lag1['Xte_iid']) < 0.15 and lag1['Xte_anti'] < -0.7,
+              ' '.join(f'{k[4:]} {v:+.2f}' for k, v in lag1.items()))
         check('fixed scaling: nothing clipped', max(s['fraction_clipped'].values()) == 0.0,
               f"max {max(s['fraction_clipped'].values()):.3f}")
     print('RESULT:', 'ALL PASS' if ok else 'FAILURES ABOVE')
@@ -363,7 +444,7 @@ def _self_test():
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
-    ap.add_argument('dataset', nargs='?', choices=['mitbih', 'synthetic'])
+    ap.add_argument('dataset', nargs='?', choices=['mitbih', 'synthetic', 'memory'])
     ap.add_argument('--db-dir')
     ap.add_argument('--out')
     ap.add_argument('--seq-len', type=int, help='synthetic only')
@@ -385,5 +466,8 @@ if __name__ == '__main__':
     elif a.dataset == 'synthetic':
         m = prepare_synthetic(a.out or 'data_splits/synthetic', seq_len=a.seq_len or 16)
         print(json.dumps({k: m[k] for k in ('counts', 'fraction_clipped', 'e4_eligibility', 'figures', 'note')}, indent=1))
+    elif a.dataset == 'memory':
+        m = prepare_memory(a.out or 'data_splits/memory', seq_len=a.seq_len or 32)
+        print(json.dumps({k: m[k] for k in ('counts', 'fraction_clipped', 'classes', 'note')}, indent=1))
     else:
         ap.error('choose a dataset or --self-test')
